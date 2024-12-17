@@ -292,23 +292,26 @@ class TrafficEvent:
         status = self._calculate_title()
         debug_stats.matches[status] += 1
         return status
-
+    
     def _calculate_title(self) -> str:
         if len(self.citi_logs) == 0 and len(self.sidera_logs) == 0:
             if len(self.carril_logs) > 0:
                 return "solo carril"
-            return ""  # Empty string for completely emp
+            return ""  # Empty string for completely empty events
         
-        if len(self.citi_logs) == 0 or len(self.sidera_logs) == 0:
-            return "no coincide"
-
+        # New logic for distinguishing no coincide cases
+        if len(self.citi_logs) == 0:
+            return "NO COINCIDE SIDERA"  # Only Sidera logs exist
+        if len(self.sidera_logs) == 0:
+            return "NO COINCIDE CITILOG"  # Only Citi logs exist
+    
         if len(self.citi_logs) == 1 and len(self.sidera_logs) == 1:
             match_state = self.citi_logs[0].compare(self.sidera_logs[0])
             if match_state == MatchState.IDENTICAL:
                 return "coincide"
             elif match_state == MatchState.SIMILAR:
                 return "coincide diff horas"
-
+    
         if len(self.citi_logs) > 1 and len(self.sidera_logs) > 1:
             return "repetido ambos"
         elif len(self.citi_logs) > len(self.sidera_logs):
@@ -316,7 +319,7 @@ class TrafficEvent:
         elif len(self.citi_logs) < len(self.sidera_logs):
             return "repetido sidera"
         
-        return "no coincide"
+        return "no coincide"  # For any other cases that don't match the above conditions
 
     def has_content(self) -> bool:
         """Check if this event has any actual content"""
@@ -409,7 +412,15 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
 
             event = TrafficEvent(citi_log)
             used_citi.add(citi_idx)
+            
+            # Check for similar Citi logs
+            for other_citi_idx, other_citi_log in citi_group:
+                if other_citi_idx != citi_idx and other_citi_idx not in used_citi:
+                    if citi_log.compare(other_citi_log) != MatchState.DIFFERENT:
+                        event.add_if_same(other_citi_log)
+                        used_citi.add(other_citi_idx)
 
+            # Then try to match with Sidera logs
             for sidera_idx, sidera_log in sidera_group:
                 if sidera_idx not in used_sidera:
                     if citi_log.compare(sidera_log) != MatchState.DIFFERENT:
@@ -447,6 +458,29 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         with open(carriles_path, encoding='iso-8859-1') as carriles_raw:
             carriles_log_file = list(csv.reader(carriles_raw, delimiter=';'))
 
+        # Create Excel workbook
+        workbook = openpyxl.Workbook()
+        
+        # Create comparison sheet (first sheet)
+        comparison_sheet = workbook.active
+        comparison_sheet.title = "Comparación"
+
+        # Add headers to comparison sheet
+        headers = [
+            # Citi headers
+            "CITILOG CameraName", "CITILOG Start", "CITILOG IncType", 
+            "CITILOG IncType", "CITILOG TEXTO AÑOS", "CITILOG TEXTO HORAS",
+            # Sidera headers
+            "SIDERA Equipo", "SIDERA Desc. variable", "SIDERA Fecha", 
+            "SIDERA TEXTO AÑOS", "SIDERA TEXTO HORAS", "SIDERA TEXTO SEGUNDOS",
+            # Carril headers
+            "CARRIL Equipo", "CARRIL Desc. variable", "CARRIL Fecha", "CARRIL Hora",
+            # Status columns
+            "ESTADO", "ESTADO CARRIL"
+        ]
+        comparison_sheet.append(headers)
+
+        # Process data for comparison sheet
         # Update total counts
         debug_stats.total_citi = len(citi_log_file) - 1
         debug_stats.total_sidera = len(sidera_log_file) - 1
@@ -460,28 +494,22 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         sidera_logs = [Log(line, False) for line in sidera_log_file[1:]]
         carril_logs = [CarrilLog(line) for line in carriles_log_file[1:]]
 
-        # First process Citi and Sidera logs
+        # Process events
         events = process_citi_sidera_logs(citi_logs, sidera_logs, debug)
-
-        # Create set to track matched carriles globally
         used_carriles = set()
 
-        # Try to match carriles to existing events first
+        # Try to match carriles to existing events
         for carril_log in carril_logs:
-            if carril_log not in used_carriles:  # Only process if not already matched
+            if carril_log not in used_carriles:
                 matched = False
-                
-                # Try to match with existing events
                 for event in events:
                     if event.try_add_carril(carril_log, used_carriles):
                         used_carriles.add(carril_log)
                         matched = True
-                        break  # Stop after first match
-                
                 if not matched and debug:
                     debug_stats.carril_matches['unmatched'] += 1
 
-        # Create events for remaining unmatched carriles
+        # Create events for unmatched carriles
         for carril_log in carril_logs:
             if carril_log not in used_carriles:
                 event = TrafficEvent(None)
@@ -490,55 +518,51 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
                 used_carriles.add(carril_log)
                 debug_stats.carril_matches['carril_only'] += 1
 
-        # Create Excel workbook
-        workbook = openpyxl.Workbook()
-        sheet = workbook.active
-        sheet.title = "Log Comparison"
-
-        # Add headers
-        headers = [
-            # Citi headers
-            "CITILOG CameraName", "CITILOG Start", "CITILOG IncType", 
-            "CITILOG IncType", "CITILOG TEXTO AÑOS", "CITILOG TEXTO HORAS",
-            # Sidera headers
-            "SIDERA Equipo", "SIDERA Desc. variable", "SIDERA Fecha", 
-            "SIDERA TEXTO AÑOS", "SIDERA TEXTO HORAS", "SIDERA TEXTO SEGUNDOS",
-            # Carril headers
-            "CARRIL Equipo", "CARRIL Desc. variable", "CARRIL Fecha", "CARRIL Hora",
-            # Status columns
-            "ESTADO", "ESTADO CARRIL"
-        ]
-        sheet.append(headers)
-
-        # Add data
+        # Add data to comparison sheet
         all_rows = []
         for event in events:
-            if event.has_content():  # Only process events with actual content
+            if event.has_content():
                 event_rows = event.return_list()
                 all_rows.extend(event_rows)
 
         # Sort rows by date/time
         sorted_rows = sorted(all_rows, key=extract_date_for_sorting)
 
-        # Additional filter to ensure no empty rows
+        # Filter empty rows
         sorted_rows = [row for row in sorted_rows if any(cell.strip() if isinstance(cell, str) else cell 
-                                                       for cell in row[:-2])]  # Exclude status columns from empty check
+                                                       for cell in row[:-2])]
 
         for row in sorted_rows:
-            sheet.append(row)
+            comparison_sheet.append(row)
 
-        # Auto-adjust column widths
-        for column in sheet.columns:
-            max_length = 0
-            column = list(column)
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = (max_length + 2)
-            sheet.column_dimensions[column[0].column_letter].width = adjusted_width
+        # Create and populate Citi sheet
+        citi_sheet = workbook.create_sheet("Citi")
+        for row in citi_log_file:
+            citi_sheet.append(row)
+
+        # Create and populate Sidera sheet
+        sidera_sheet = workbook.create_sheet("Sidera")
+        for row in sidera_log_file:
+            sidera_sheet.append(row)
+
+        # Create and populate Carriles sheet
+        carriles_sheet = workbook.create_sheet("Carriles")
+        for row in carriles_log_file:
+            carriles_sheet.append(row)
+
+        # Auto-adjust column widths for all sheets
+        for sheet in workbook.sheetnames:
+            for column in workbook[sheet].columns:
+                max_length = 0
+                column = list(column)
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                workbook[sheet].column_dimensions[column[0].column_letter].width = adjusted_width
 
         print(f"\nWriting {output_path}...")
         workbook.save(output_path)
