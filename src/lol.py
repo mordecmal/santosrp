@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict, Set
 from datetime import datetime, timedelta
 from collections import Counter
 import openpyxl
+import time
 
 class DebugStats:
     def __init__(self):
@@ -177,17 +178,27 @@ class CarrilLog:
     def matches_time(self, other_hour: str) -> bool:
         """Check if time matches within tolerance"""
         try:
-            return is_similar_time(self.hour, other_hour)
+            return is_similar_time(self.hour, other_hour)  # Uses existing 1-minute tolerance
         except ValueError:
             return False
 
     def matches_event(self, log: Log) -> bool:
-        """Check if this carril matches a log entry"""
+        """
+        Check if this carril matches a log entry.
+        Matches if:
+        1. Camera prefix matches
+        2. Description is exactly the same
+        3. Time is within 1 minute (using existing tolerance)
+        """
         # First check the 6-char prefix match
         if not self.matches_camera(log.camera_id):
             return False
             
-        # Then check time match
+        # Check description matching
+        if self.desc != log.desc:
+            return False
+            
+        # Then check time match with 1-minute tolerance
         if not self.matches_time(log.hour):
             return False
             
@@ -197,14 +208,15 @@ class CarrilLog:
         return f"{self.full_id}_{self.date}_{self.hour}"
 
 class TrafficEvent:
-    def __init__(self, log: Log):
+    def __init__(self, log: Log = None):
         self.citi_logs: List[Log] = []
         self.sidera_logs: List[Log] = []
         self.carril_logs: List[CarrilLog] = []
-        if log.is_citi:
-            self.citi_logs.append(log)
-        else:
-            self.sidera_logs.append(log)
+        if log is not None:
+            if log.is_citi:
+                self.citi_logs.append(log)
+            else:
+                self.sidera_logs.append(log)
 
     def add_if_same(self, log: Log) -> bool:
         if log.is_citi:
@@ -223,35 +235,38 @@ class TrafficEvent:
                 return True
         return False
 
-    def try_add_carril(self, carril: CarrilLog) -> bool:
+    def try_add_carril(self, carril: CarrilLog, used_carriles: Set[CarrilLog]) -> bool:
         """Try to add a carril log if it matches this event"""
-        matched = False
+        if carril in used_carriles or carril in self.carril_logs:
+            return False
+            
+        matched = False 
         
-        # Check against Citi logs
         for citi_log in self.citi_logs:
             if carril.matches_event(citi_log):
-                if carril not in self.carril_logs:  # Avoid duplicates
-                    self.carril_logs.append(carril)
-                    debug_stats.carril_matches['matched_citi'] += 1
+                self.carril_logs.append(carril)
+                debug_stats.carril_matches['matched_citi'] += 1
                 matched = True
-
-        # Check against Sidera logs
-        for sidera_log in self.sidera_logs:
-            if carril.matches_event(sidera_log):
-                if carril not in self.carril_logs:  # Avoid duplicates
+                break  # Stop after first match
+                
+        # If not matched with Citi, try Sidera logs
+        if not matched:
+            for sidera_log in self.sidera_logs:
+                if carril.matches_event(sidera_log):
                     self.carril_logs.append(carril)
                     debug_stats.carril_matches['matched_sidera'] += 1
-                matched = True
+                    matched = True
+                    break  # Stop after first match
 
-        # For "no coincide" cases, match if camera prefix matches and time is within range
-        if not self.has_match() and (self.citi_logs or self.sidera_logs):
+        # For "no coincide" cases
+        if not matched and not self.has_match() and (self.citi_logs or self.sidera_logs):
             source_logs = self.citi_logs if self.citi_logs else self.sidera_logs
             for log in source_logs:
                 if carril.matches_event(log):
-                    if carril not in self.carril_logs:  # Avoid duplicates
-                        self.carril_logs.append(carril)
-                        debug_stats.carril_matches['matched_no_coincide'] += 1
+                    self.carril_logs.append(carril)
+                    debug_stats.carril_matches['matched_no_coincide'] += 1
                     matched = True
+                    break  # Stop after first match
 
         return matched
 
@@ -259,12 +274,31 @@ class TrafficEvent:
         """Check if this event has matching Citi and Sidera logs"""
         return len(self.citi_logs) > 0 and len(self.sidera_logs) > 0
 
+    def carril_state(self) -> str:
+        """
+        Determine the carril state for this event.
+        A carril can either be:
+        - "incidente con carril" if there are both carriles and incidents
+        - "carril sin incidente" if there are only carriles
+        - "" (empty string) if there are no carriles
+        """
+        if len(self.carril_logs) > 0:
+            if len(self.citi_logs) > 0 or len(self.sidera_logs) > 0:
+                return "incidente con carril"
+            return "carril sin incidente"
+        return ""  # Empty string for events without carriles
+
     def title(self) -> str:
         status = self._calculate_title()
         debug_stats.matches[status] += 1
         return status
 
     def _calculate_title(self) -> str:
+        if len(self.citi_logs) == 0 and len(self.sidera_logs) == 0:
+            if len(self.carril_logs) > 0:
+                return "solo carril"
+            return ""  # Empty string for completely emp
+        
         if len(self.citi_logs) == 0 or len(self.sidera_logs) == 0:
             return "no coincide"
 
@@ -277,15 +311,23 @@ class TrafficEvent:
 
         if len(self.citi_logs) > 1 and len(self.sidera_logs) > 1:
             return "repetido ambos"
-
-        if len(self.citi_logs) > len(self.sidera_logs):
+        elif len(self.citi_logs) > len(self.sidera_logs):
             return "repetido citi"
         elif len(self.citi_logs) < len(self.sidera_logs):
             return "repetido sidera"
         
         return "no coincide"
 
+    def has_content(self) -> bool:
+        """Check if this event has any actual content"""
+        return (len(self.citi_logs) > 0 or 
+                len(self.sidera_logs) > 0 or 
+                len(self.carril_logs) > 0)
+
     def return_list(self) -> List:
+        if not self.has_content():
+            return []  # Return empty list if no actual content
+            
         cached_title = self.title()
         max_length = max(len(self.citi_logs), len(self.sidera_logs), len(self.carril_logs))
 
@@ -298,8 +340,22 @@ class TrafficEvent:
         carril_padded = carril_output + [EMPTY_CARRIL] * (max_length - len(carril_output))
 
         return_list = []
-        for citi_log, sidera_log, carril_log in zip(citi_padded, sidera_padded, carril_padded):
-            return_list.append(citi_log + sidera_log + carril_log + [cached_title])
+        for i in range(max_length):
+            citi_row = citi_padded[i]
+            sidera_row = sidera_padded[i]
+            carril_row = carril_padded[i]
+            
+            # If this row has only a carril (empty citi and sidera), use empty estado
+            if (all(not cell for cell in citi_row) and 
+                all(not cell for cell in sidera_row) and 
+                any(cell for cell in carril_row)):
+                row_title = ""
+            else:
+                row_title = cached_title
+
+            # Only add rows that have at least some content
+            if any(cell for cell in citi_row + sidera_row + carril_row):
+                return_list.append(citi_row + sidera_row + carril_row + [row_title, self.carril_state()])
 
         return return_list
 
@@ -319,7 +375,7 @@ def extract_date_for_sorting(event_row: List) -> datetime:
     except (ValueError, IndexError):
         return datetime.min
 
-def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug: bool = False) -> List[TrafficEvent]:
+def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug: bool = False) -> Tuple[List[TrafficEvent], Set[CarrilLog]]:
     events = []
     used_sidera = set()
     used_citi = set()
@@ -372,9 +428,12 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
 
     return events
 
+def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: bool = False, output_path: str = "output.xlsx"):
+    start_time = time.time()
 
 def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: bool = False, output_path: str = "output.xlsx"):
     print("Iniciando comparación...")
+    start_time = time.time()
     debug_stats.__init__()
     
     try:
@@ -404,15 +463,32 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         # First process Citi and Sidera logs
         events = process_citi_sidera_logs(citi_logs, sidera_logs, debug)
 
-        # Then try to match carriles to existing events
+        # Create set to track matched carriles globally
+        used_carriles = set()
+
+        # Try to match carriles to existing events first
         for carril_log in carril_logs:
-            matched = False
-            for event in events:
-                if event.try_add_carril(carril_log):
-                    matched = True
-                    break
-            if not matched and debug:
-                debug_stats.carril_matches['unmatched'] += 1
+            if carril_log not in used_carriles:  # Only process if not already matched
+                matched = False
+                
+                # Try to match with existing events
+                for event in events:
+                    if event.try_add_carril(carril_log, used_carriles):
+                        used_carriles.add(carril_log)
+                        matched = True
+                        break  # Stop after first match
+                
+                if not matched and debug:
+                    debug_stats.carril_matches['unmatched'] += 1
+
+        # Create events for remaining unmatched carriles
+        for carril_log in carril_logs:
+            if carril_log not in used_carriles:
+                event = TrafficEvent(None)
+                event.carril_logs.append(carril_log)
+                events.append(event)
+                used_carriles.add(carril_log)
+                debug_stats.carril_matches['carril_only'] += 1
 
         # Create Excel workbook
         workbook = openpyxl.Workbook()
@@ -429,19 +505,24 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
             "SIDERA TEXTO AÑOS", "SIDERA TEXTO HORAS", "SIDERA TEXTO SEGUNDOS",
             # Carril headers
             "CARRIL Equipo", "CARRIL Desc. variable", "CARRIL Fecha", "CARRIL Hora",
-            # Status
-            "ESTADO"
+            # Status columns
+            "ESTADO", "ESTADO CARRIL"
         ]
         sheet.append(headers)
 
         # Add data
         all_rows = []
         for event in events:
-            event_rows = event.return_list()
-            all_rows.extend(event_rows)
+            if event.has_content():  # Only process events with actual content
+                event_rows = event.return_list()
+                all_rows.extend(event_rows)
 
         # Sort rows by date/time
         sorted_rows = sorted(all_rows, key=extract_date_for_sorting)
+
+        # Additional filter to ensure no empty rows
+        sorted_rows = [row for row in sorted_rows if any(cell.strip() if isinstance(cell, str) else cell 
+                                                       for cell in row[:-2])]  # Exclude status columns from empty check
 
         for row in sorted_rows:
             sheet.append(row)
@@ -462,6 +543,10 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         print(f"\nWriting {output_path}...")
         workbook.save(output_path)
         print(f"Successfully saved {output_path}")
+        
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"\nExecution time: {execution_time:.2f} seconds")
         
         # Print statistics
         debug_stats.print_summary()
