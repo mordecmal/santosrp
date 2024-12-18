@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from collections import Counter
 import openpyxl
 import time
+from openpyxl.styles import PatternFill, Font
 
 class DebugStats:
     def __init__(self):
@@ -384,70 +385,87 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
     used_sidera = set()
     used_citi = set()
 
-    # First handle all ? cameras - they each get their own event
-    for idx, log in enumerate(citi_logs):
-        if log.camera_id == '?' and idx not in used_citi:
-            event = TrafficEvent(log)
-            used_citi.add(idx)
-            events.append(event)
-            
-    for idx, log in enumerate(sidera_logs):
-        if log.camera_id == '?' and idx not in used_sidera:
-            event = TrafficEvent(log)
-            used_sidera.add(idx)
-            events.append(event)
-
-    # Group remaining non-? logs by camera ID
+    # Group logs by camera ID
     citi_by_camera: Dict[str, List[Tuple[int, Log]]] = {}
     sidera_by_camera: Dict[str, List[Tuple[int, Log]]] = {}
 
+    # First, group all logs by camera ID
     for idx, log in enumerate(citi_logs):
-        if log.camera_id != '?' and idx not in used_citi:  # Skip already used ? cameras
-            if log.camera_id not in citi_by_camera:
-                citi_by_camera[log.camera_id] = []
-            citi_by_camera[log.camera_id].append((idx, log))
+        if log.camera_id not in citi_by_camera:
+            citi_by_camera[log.camera_id] = []
+        citi_by_camera[log.camera_id].append((idx, log))
 
     for idx, log in enumerate(sidera_logs):
-        if log.camera_id != '?' and idx not in used_sidera:  # Skip already used ? cameras
-            if log.camera_id not in sidera_by_camera:
-                sidera_by_camera[log.camera_id] = []
-            sidera_by_camera[log.camera_id].append((idx, log))
+        if log.camera_id not in sidera_by_camera:
+            sidera_by_camera[log.camera_id] = []
+        sidera_by_camera[log.camera_id].append((idx, log))
 
-    # Process each non-? camera ID
+    # Process each camera ID
     for camera_id in set(citi_by_camera.keys()) | set(sidera_by_camera.keys()):
+        if camera_id == '?':
+            # Handle ? cameras separately
+            for citi_idx, citi_log in citi_by_camera.get(camera_id, []):
+                if citi_idx not in used_citi:
+                    event = TrafficEvent(citi_log)
+                    used_citi.add(citi_idx)
+                    events.append(event)
+            
+            for sidera_idx, sidera_log in sidera_by_camera.get(camera_id, []):
+                if sidera_idx not in used_sidera:
+                    event = TrafficEvent(sidera_log)
+                    used_sidera.add(sidera_idx)
+                    events.append(event)
+            continue
+
         citi_group = citi_by_camera.get(camera_id, [])
         sidera_group = sidera_by_camera.get(camera_id, [])
 
-        # Process matches
+        # Try to find matches between Citi and Sidera first
         for citi_idx, citi_log in citi_group:
             if citi_idx in used_citi:
                 continue
 
+            best_match = None
+            best_match_idx = None
             event = TrafficEvent(citi_log)
             used_citi.add(citi_idx)
-            
-            # Check for similar Citi logs
+
+            # Look for matching Sidera log
+            for sidera_idx, sidera_log in sidera_group:
+                if sidera_idx not in used_sidera:
+                    match_state = citi_log.compare(sidera_log)
+                    if match_state != MatchState.DIFFERENT:
+                        best_match = sidera_log
+                        best_match_idx = sidera_idx
+                        break  # Found a match, no need to continue searching
+
+            # If found a match, add it to the event
+            if best_match is not None:
+                event.add_if_same(best_match)
+                used_sidera.add(best_match_idx)
+
+            # Look for similar Citi logs
             for other_citi_idx, other_citi_log in citi_group:
                 if other_citi_idx != citi_idx and other_citi_idx not in used_citi:
                     if citi_log.compare(other_citi_log) != MatchState.DIFFERENT:
                         event.add_if_same(other_citi_log)
                         used_citi.add(other_citi_idx)
 
-            # Try to match with Sidera logs
-            for sidera_idx, sidera_log in sidera_group:
-                if sidera_idx not in used_sidera:
-                    if citi_log.compare(sidera_log) != MatchState.DIFFERENT:
-                        event.add_if_same(sidera_log)
-                        used_sidera.add(sidera_idx)
-
             events.append(event)
 
-    # Handle remaining Sidera logs (non-?)
-    for camera_id, sidera_group in sidera_by_camera.items():
+        # Handle remaining unmatched Sidera logs for this camera
         for sidera_idx, sidera_log in sidera_group:
             if sidera_idx not in used_sidera:
                 event = TrafficEvent(sidera_log)
                 used_sidera.add(sidera_idx)
+
+                # Look for similar Sidera logs
+                for other_sidera_idx, other_sidera_log in sidera_group:
+                    if other_sidera_idx != sidera_idx and other_sidera_idx not in used_sidera:
+                        if sidera_log.compare(other_sidera_log) != MatchState.DIFFERENT:
+                            event.add_if_same(other_sidera_log)
+                            used_sidera.add(other_sidera_idx)
+
                 events.append(event)
 
     return events
@@ -487,7 +505,7 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
                 'fill': PatternFill(start_color='00FF00', end_color='00FF00', fill_type='solid'),  # Green
                 'font': Font(color='000000')
             },
-            'no coincide citilog': {
+            'NO COINCIDE CITILOG': {  # Fixed case to match the status string
                 'fill': PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid'),  # Red
                 'font': Font(color='000000')
             },
@@ -495,8 +513,8 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
                 'fill': PatternFill(start_color='0000FF', end_color='0000FF', fill_type='solid'),  # Blue
                 'font': Font(color='000000')
             },
-            'no coincide sidera': {
-                'fill': PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid'),  # Red (changed from pink)
+            'NO COINCIDE SIDERA': {  # Fixed case to match the status string
+                'fill': PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid'),  # Red
                 'font': Font(color='000000')
             },
             'repetido citi': {
@@ -511,8 +529,7 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
                 'fill': PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid'),  # Yellow
                 'font': Font(color='000000')
             }
-        }
-
+}
         # Rest of the code remains the same...
 
         # Add headers to comparison sheet
