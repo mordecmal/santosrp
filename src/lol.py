@@ -127,6 +127,7 @@ class Log:
             print(f"Self:  {self.camera_id} | {self.desc} | {self.year} | {self.hour}")
             print(f"Other: {other.camera_id} | {other.desc} | {other.year} | {other.hour}")
 
+        # If either camera is "?", they can't match
         if self.camera_id == '?' or other.camera_id == '?':
             debug_stats.failed_matches['question_mark_camera'] += 1
             return MatchState.DIFFERENT
@@ -383,25 +384,37 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
     used_sidera = set()
     used_citi = set()
 
-    # Group logs by camera ID
+    # First handle all ? cameras - they each get their own event
+    for idx, log in enumerate(citi_logs):
+        if log.camera_id == '?' and idx not in used_citi:
+            event = TrafficEvent(log)
+            used_citi.add(idx)
+            events.append(event)
+            
+    for idx, log in enumerate(sidera_logs):
+        if log.camera_id == '?' and idx not in used_sidera:
+            event = TrafficEvent(log)
+            used_sidera.add(idx)
+            events.append(event)
+
+    # Group remaining non-? logs by camera ID
     citi_by_camera: Dict[str, List[Tuple[int, Log]]] = {}
     sidera_by_camera: Dict[str, List[Tuple[int, Log]]] = {}
 
     for idx, log in enumerate(citi_logs):
-        if log.camera_id not in citi_by_camera:
-            citi_by_camera[log.camera_id] = []
-        citi_by_camera[log.camera_id].append((idx, log))
+        if log.camera_id != '?' and idx not in used_citi:  # Skip already used ? cameras
+            if log.camera_id not in citi_by_camera:
+                citi_by_camera[log.camera_id] = []
+            citi_by_camera[log.camera_id].append((idx, log))
 
     for idx, log in enumerate(sidera_logs):
-        if log.camera_id not in sidera_by_camera:
-            sidera_by_camera[log.camera_id] = []
-        sidera_by_camera[log.camera_id].append((idx, log))
+        if log.camera_id != '?' and idx not in used_sidera:  # Skip already used ? cameras
+            if log.camera_id not in sidera_by_camera:
+                sidera_by_camera[log.camera_id] = []
+            sidera_by_camera[log.camera_id].append((idx, log))
 
-    # Process each camera ID
+    # Process each non-? camera ID
     for camera_id in set(citi_by_camera.keys()) | set(sidera_by_camera.keys()):
-        if camera_id == '?':
-            continue
-
         citi_group = citi_by_camera.get(camera_id, [])
         sidera_group = sidera_by_camera.get(camera_id, [])
 
@@ -420,7 +433,7 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
                         event.add_if_same(other_citi_log)
                         used_citi.add(other_citi_idx)
 
-            # Then try to match with Sidera logs
+            # Try to match with Sidera logs
             for sidera_idx, sidera_log in sidera_group:
                 if sidera_idx not in used_sidera:
                     if citi_log.compare(sidera_log) != MatchState.DIFFERENT:
@@ -429,7 +442,7 @@ def process_citi_sidera_logs(citi_logs: List[Log], sidera_logs: List[Log], debug
 
             events.append(event)
 
-    # Handle remaining Sidera logs
+    # Handle remaining Sidera logs (non-?)
     for camera_id, sidera_group in sidera_by_camera.items():
         for sidera_idx, sidera_log in sidera_group:
             if sidera_idx not in used_sidera:
@@ -465,6 +478,43 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         comparison_sheet = workbook.active
         comparison_sheet.title = "Comparación"
 
+        # Define styles
+        from openpyxl.styles import PatternFill, Font
+
+        # Color definitions with black text for all
+        styles = {
+            'coincide': {
+                'fill': PatternFill(start_color='00FF00', end_color='00FF00', fill_type='solid'),  # Green
+                'font': Font(color='000000')
+            },
+            'no coincide citilog': {
+                'fill': PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid'),  # Red
+                'font': Font(color='000000')
+            },
+            'coincide diff horas': {
+                'fill': PatternFill(start_color='0000FF', end_color='0000FF', fill_type='solid'),  # Blue
+                'font': Font(color='000000')
+            },
+            'no coincide sidera': {
+                'fill': PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid'),  # Red (changed from pink)
+                'font': Font(color='000000')
+            },
+            'repetido citi': {
+                'fill': PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid'),  # Yellow
+                'font': Font(color='000000')
+            },
+            'repetido sidera': {
+                'fill': PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid'),  # Yellow
+                'font': Font(color='000000')
+            },
+            'repetido ambos': {
+                'fill': PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid'),  # Yellow
+                'font': Font(color='000000')
+            }
+        }
+
+        # Rest of the code remains the same...
+
         # Add headers to comparison sheet
         headers = [
             # Citi headers
@@ -481,7 +531,6 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         comparison_sheet.append(headers)
 
         # Process data for comparison sheet
-        # Update total counts
         debug_stats.total_citi = len(citi_log_file) - 1
         debug_stats.total_sidera = len(sidera_log_file) - 1
         debug_stats.total_carriles = len(carriles_log_file) - 1
@@ -532,20 +581,29 @@ def compare_files(citi_path: str, sidera_path: str, carriles_path: str, debug: b
         sorted_rows = [row for row in sorted_rows if any(cell.strip() if isinstance(cell, str) else cell 
                                                        for cell in row[:-2])]
 
-        for row in sorted_rows:
+        # Add rows to sheet with formatting
+        for row_idx, row in enumerate(sorted_rows, start=2):  # start=2 because row 1 is headers
             comparison_sheet.append(row)
+            
+            # Get the status (second to last column)
+            status = row[-2]
+            
+            # Apply formatting based on status
+            if status in styles:
+                for col in range(1, len(row) + 1):  # Excel columns are 1-based
+                    cell = comparison_sheet.cell(row=row_idx, column=col)
+                    cell.fill = styles[status]['fill']
+                    cell.font = styles[status]['font']
 
-        # Create and populate Citi sheet
+        # Create and populate other sheets
         citi_sheet = workbook.create_sheet("Citi")
         for row in citi_log_file:
             citi_sheet.append(row)
 
-        # Create and populate Sidera sheet
         sidera_sheet = workbook.create_sheet("Sidera")
         for row in sidera_log_file:
             sidera_sheet.append(row)
 
-        # Create and populate Carriles sheet
         carriles_sheet = workbook.create_sheet("Carriles")
         for row in carriles_log_file:
             carriles_sheet.append(row)
